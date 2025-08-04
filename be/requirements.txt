@@ -1,0 +1,9 @@
+dotenv
+langchain-text-splitters
+langchain-community
+langgraph
+langchain[google-genai]
+langchain-google-genai
+langchain-chroma
+beautifulsoup4==4.13.4
+fastapi[standard]
