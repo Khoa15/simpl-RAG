@@ -51,6 +51,8 @@ const FileUpload = () => {
       file,
       file.name
     );
+    formData.append("uid", localStorage.getItem("uid"))
+
     console.log("Đang gửi ảnh")
     try{
       

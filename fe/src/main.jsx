@@ -8,3 +8,8 @@ createRoot(document.getElementById('root')).render(
     <App />
   </StrictMode>,
 )
+
+
+localStorage.setItem(
+  "uid", crypto.randomUUID()
+)

@@ -9,8 +9,9 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain import hub
 from langchain_core.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+# from langchain.chains.retrieval_qa.base import RetrievalQA
 
 from src.rag import PROMPTS
 
@@ -46,20 +47,22 @@ def PDFLoader(file_path):
 def SplittingDocuments(docs):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
-        chunk_overlap=200,
-        add_start_index=True,
+        chunk_overlap=100,
+        # add_start_index=True,
+            # separators=["\n\n", "\n", " ", ""]
     )
     
     all_splits = text_splitter.split_documents(docs)
 
+    logger.warning(all_splits)
     return all_splits
 
 def StoringDocuments(splitted_docs):
     try:
-        document_ids = vector_store.from_documents(splitted_docs)
+        vectorstores = vector_store.from_documents(splitted_docs, embedding=embeddings)
     except GoogleGenerativeAIError as e:
         raise MemoryError(e)
-    return document_ids
+    return vectorstores
 
 def Retrieve(state: State):
     retrieved_docs = vector_store.similarity_search(state["question"])
@@ -71,3 +74,47 @@ def Generate(state: State):
     messages = prompt.invoke({"question": state["question"], "context": docs_content})
     response = llm.invoke(messages)
     return {"answer": response.content}
+
+
+def RetrieveDocument(query, retriever):
+    # qa_chain = RetrievalQA.from_llm(
+    #     llm,
+    #     retriever=retriever,
+    #     prompt=prompt
+    # )
+    # try:
+    #     result = qa_chain(query)
+    # except GoogleGenerativeAIError as e:
+    #     if e.args[0] == 429:
+    #         raise QuotaRateLimit(e)
+    #     else:
+    #         raise MemoryError(e)
+    # return result
+    from langchain_core.runnables import RunnablePassthrough
+    from langchain_core.output_parsers import StrOutputParser
+
+    qa_chain = (
+        {
+            "context": retriever,
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return qa_chain.invoke(query)
+
+    # docs = retriever.invoke(query)
+    # docs_content = "\n\n".join(doc.page_content for doc in docs)
+    # chain = prompt | llm
+
+    # response = chain.invoke({
+    #     "question": query,
+    #     "context": docs_content
+    # })
+
+    # return response.content, docs_content
+
+class QuotaRateLimit(Exception):
+    def __init__(self, *args):
+        super().__init__(*args)

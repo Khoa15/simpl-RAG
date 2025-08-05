@@ -27,6 +27,8 @@ const ChatForm = () => {
       
       const data = new FormData();
       data.append("query_text", newMessage)
+      data.append("uid", localStorage.getItem("uid"))
+
       try{
         const response = await fetch(`${config.apiUrl}/v1/retrieve`, {
           method: 'post',
