@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { config } from './core/config';
 
 const ChatForm = () => {
   const [messages, setMessages] = useState<any>([]);
@@ -17,12 +18,45 @@ const ChatForm = () => {
     setNewMessage(e.target.value);
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (newMessage.trim()) {
 
       setMessages([...messages, { id: Date.now(), text: newMessage, sender: 'You' }]);
       setNewMessage('');
+      
+      const data = new FormData();
+      data.append("query_text", newMessage)
+      try{
+        const response = await fetch(`${config.apiUrl}/v1/retrieve`, {
+          method: 'post',
+          body: data
+        });
+
+        const result = await response.json();
+
+        if (response.ok){
+          setMessages(prevState => {
+            return prevState.concat({
+              id: Date.now(),
+              text: result['message'],
+              sender: 'ChatBot'
+            })
+          });
+          setNewMessage('');
+        }else{
+          setMessages(prevState => {
+            return prevState.concat({
+              id: Date.now(),
+              text: 'Đã có lỗi bất ngờ! Bạn hãy thử lại sau nhé.',
+              sender: 'ChatBot'
+            })
+          });
+          setNewMessage('');
+        }
+      }catch(error){
+        console.error(error);
+      }
     }
   };
 
