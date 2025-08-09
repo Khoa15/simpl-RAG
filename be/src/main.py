@@ -1,48 +1,42 @@
-import time
+import asyncio
+import json
 import logging
-import threading
+import pickle
+import time
 from typing import Annotated, Union
-from fastapi import FastAPI, Form, UploadFile
+from fastapi import FastAPI, Form, UploadFile, HTTPException
 from fastapi.concurrency import asynccontextmanager
 from fastapi.datastructures import FormData
 from fastapi.middleware.cors import CORSMiddleware
-from src.rag.preprocess import PDFLoader, QuotaRateLimit, SplittingDocuments, StoringDocuments, RetrieveDocument
-from langgraph.graph import START, StateGraph
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from celery.result import AsyncResult
+from redis.asyncio import Redis as AsyncRedis
+from redis import Redis
 
+from src.celery_worker import process_document
+from src.rag.preprocess import QuotaRateLimit, RetrieveDocument
+
+# Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+INACTIVITY_TTL = 1800
 
-
-async def cleanup_task():
-    while True:
-        for user in users_vectorstores:
-            if user['time'] < time.time() - 108000:
-                del user
-                
-
+async_redis_client = AsyncRedis(host="localhost", port=6379, db=1, decode_responses=True)
+async_redis_binary_client = AsyncRedis(host="localhost", port=6379, db=1, decode_responses=False)
+sync_redis_client = Redis(host="localhost", port=6379, db=1, decode_responses=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = AsyncIOScheduler(timezone="Asia/Ho_Chi_Minh")
-    scheduler.add_job(func=cleanup_task, trigger="interval", seconds=1800)
-    scheduler.start()
     try:
         yield
     finally:
-        scheduler.shutdown(wait=False)
-
-
+        pass
 
 app = FastAPI(lifespan=lifespan)
 
-origins = [
-    "http://localhost:3000", # frontend
-]
-
-users_vectorstores = {}
-
+origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -55,76 +49,77 @@ app.add_middleware(
 def read_root():
     return {"Hello": "World"}
 
-
 @app.post("/api/v1/document")
 async def get_document_from_client(file: UploadFile | None, uid: Annotated[str, Form()]):
     if not file:
-        return {
-            'status': 200,
-            "message": "No upload file sent"
-            }
+        raise HTTPException(status_code=400, detail="No upload file sent")
     
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
-        tmp.write(await file.read())
-        tmp.flush()
-
-
-        docs = PDFLoader(tmp.name)
-
-    splitted_docs = SplittingDocuments(docs)
-
     try:
-        users_vectorstores[uid] = {
-            "time": time.time(),
-            "vectorstores": StoringDocuments(splitted_docs)
+        # Đọc nội dung file dưới dạng bytes
+        contents: bytes = await file.read()
+        
+        # Gửi trực tiếp nội dung bytes đến Celery worker
+        task = process_document.delay(contents, uid)
+            
+        await async_redis_client.set(f"user:{uid}:status", "processing", ex=INACTIVITY_TTL)
+        
+        return {
+            'status': 202,
+            'message': 'Upload accepted, processing in background.',
+            'task_id': task.id
         }
-    except MemoryError as e:
-        if e.args[0] == 500:
-            return {
-                'status': 500,
-                'message': 'Your file is too large'
-            }
-        else:
-            return {
-                'status': 500,
-                'message': 'Upload failed'
-            }
-
-    return {
-        'status': 200,
-        'message': 'Upload successfully'
-    }
+    except Exception as e:
+        logger.error(f"Error processing document upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
 @app.post('/api/v1/retrieve')
 async def retrieve_documents(query_text: Annotated[str, Form()], uid: Annotated[str, Form()]):
-    if uid not in users_vectorstores.keys():
-        return {
-            'status': 200,
-            'message': 'You should upload a document first'
-        }
-    retriever = users_vectorstores[uid]['vectorstores'].as_retriever()
-
-    try:
-        result = RetrieveDocument(query_text, retriever)
-    except QuotaRateLimit as e:
-        return {
-            'status': 500,
-            'message': 'Please wait a minute because of too much request'
-        }
-    except Exception as e:
-        return {
-            'status': 500,
-            'message': 'There have some errors. Please wait!'
-        }
-
+    status = await async_redis_client.get(f"user:{uid}:status")
     
-    return {
+    if status is None:
+        raise HTTPException(status_code=404, detail="User session not found. Please upload a document first.")
+    
+    if status != "ready":
+        raise HTTPException(status_code=400, detail="Document is still being processed. Please wait.")
+    
+    try:
+        serialized_vectorstore = await async_redis_binary_client.get(f"user:{uid}:vectorstore")
+        
+        if not serialized_vectorstore:
+            raise HTTPException(status_code=404, detail="Vectorstore data not found in Redis.")
+        
+        def deserialize_vectorstore_sync(data):
+            return pickle.loads(data)
+
+        retriever = await asyncio.to_thread(deserialize_vectorstore_sync, serialized_vectorstore)
+        # retriever = vectorstore.as_retriever()
+        
+        result = await asyncio.to_thread(RetrieveDocument, query_text, retriever)
+
+        return {
             'status': 200,
             'question': query_text,
             'message': result
         }
+    except QuotaRateLimit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded, please wait.")
+    except Exception as e:
+        logger.error(f"Error retrieving document: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
-
-
+@app.get("/api/v1/task_status")
+async def get_task_status(task_id: str):
+    task_result = AsyncResult(task_id, app=process_document)
+    
+    if task_result.ready():
+        status = "Completed"
+        result = task_result.result
+    else:
+        status = "Processing"
+        result = None
+        
+    return {
+        "task_id": task_id,
+        "status": status,
+        "result": result
+    }

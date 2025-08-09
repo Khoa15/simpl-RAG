@@ -1,0 +1,55 @@
+name: CI-CD FastAPI RAG Project
+
+on:
+  push:
+    branches: ["develop"]
+  pull_request:
+    branches: ["develop"]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:20.10.16-dind
+        # privileged: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Docker image
+        run: |
+          docker build -t fastapi-rag-dev .
+
+      - name: Run FastAPI container
+        run: |
+          docker run -d --name fastapi-rag -p 8000:8000 fastapi-rag-dev
+          sleep 5  # chờ service lên
+
+      - name: Install dependencies for tests
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest locust requests
+
+      - name: Run Pytest (unit + integration tests)
+        run: |
+          pytest --maxfail=1 --disable-warnings -q
+
+      - name: Run Locust smoke test
+        run: |
+          locust -f tests/load_test.py --headless -u 5 -r 1 -t 10s --host http://localhost:8000
+
+  # Optional: Deploy stage (disabled for now)
+  # deploy:
+  #   needs: build-test
+  #   runs-on: ubuntu-latest
+  #   if: success()
+  #   steps:
+  #     - name: Deploy to server
+  #       run: echo "Deploy step here..."

@@ -9,3 +9,6 @@ beautifulsoup4==4.13.4
 fastapi[standard]
 pypdf
 APScheduler==3.11.0
+pytest
+locust
+fpdf
