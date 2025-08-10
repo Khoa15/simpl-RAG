@@ -1,32 +1,38 @@
 version: '3.8'
 
 services:
-  redis:
-    image: redis:7.0-alpine
-    container_name: my_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: my_fastapi_app
+    build: .
     ports:
       - "8000:8000"
+    restart: "on-failure"
+    environment:
+      REDIS_URL: redis://redis:6379/1
+      USE_MOCK_EMBEDDINGS: "True"
     depends_on:
       - redis
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      # - GOOGLE_API_KEY=your_api_key
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  
+  redis:
+    image: "redis:7-alpine"
     volumes:
-      - ./:/app
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-    restart: unless-stopped
+      - redis-data:/data
+    ports:
+      - "6379:6379"
 
+  celery_worker:
+    build: .
+    restart: "on-failure"
+    environment:
+      REDIS_URL: redis://redis:6379/1
+      USE_MOCK_EMBEDDINGS: "True"
+    command: python -m celery -A src.celery_worker:celery_app worker --loglevel=info
+    depends_on:
+      - redis
+      
 volumes:
-  redis_data:
+  redis-data:

@@ -26,7 +26,7 @@ if not os.environ.get("GOOGLE_API_KEY"):
     logger.warning("GOOGLE API KEY is not found")
 
 # Khởi tạo đối tượng embeddings một lần duy nhất
-USE_MOCK_EMBEDDINGS = os.getenv("USE_MOCK_EMBEDDINGS", "False").lower() in ("true", "1", "t")
+USE_MOCK_EMBEDDINGS = os.environ.get("USE_MOCK_EMBEDDINGS", "False").lower() in ("true", "1", "t")
 
 # Định nghĩa một lớp mock để thay thế GoogleGenerativeAIEmbeddings
 class MockEmbeddings:

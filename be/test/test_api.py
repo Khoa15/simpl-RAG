@@ -57,7 +57,7 @@ def test_upload_and_retrieve():
         print(f"Lỗi tải lên: {upload_response.status_code} - {upload_response.text}")
         return
 
-    # Chờ xử lý hoàn tất (vì nó chạy trên luồng khác)
+    # Chờ xử lý hoàn tất
     time.sleep(5) 
 
     # Gửi câu truy vấn

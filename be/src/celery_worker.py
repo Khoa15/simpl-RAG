@@ -10,12 +10,12 @@ from src.rag.preprocess import PDFLoader, SplittingDocuments, StoringDocuments
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-redis_client = Redis(host="localhost", port=6379, db=1, decode_responses=False)
+redis_client = Redis(host="redis", port=6379, db=1, decode_responses=False)
 
 celery_app = Celery(
     "worker",
-    broker="redis://localhost:6379/0",
-    backend="redis://localhost:6379/0"
+    broker="redis://redis:6379/0",
+    backend="redis://redis:6379/0"
 )
 
 celery_app.conf.update(

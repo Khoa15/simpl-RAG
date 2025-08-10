@@ -4,6 +4,7 @@ import tempfile
 import threading
 from locust import HttpUser, task, between
 from random import choice
+import random as Random
 from fpdf import FPDF
 
 # Tên file PDF sẽ được tạo
@@ -45,42 +46,47 @@ processed_uids = []
 uid_lock = threading.Lock()
 
 class WebsiteUser(HttpUser):
-    wait_time = between(0, 1)
+    wait_time = between(1, 5)
 
     def on_start(self):
         """Hành động khi một người dùng ảo bắt đầu."""
-        self.uid = str(uuid.uuid4())
+        self.uid = Random.randint(0, 1000)
         self.pdf_file = pdf_file_content
 
-    # @task(3)
-    # def retrieve_document(self):
-    #     """Task lấy thông tin từ tài liệu đã xử lý."""
-    #     if processed_uids:
-    #         uid_to_retrieve = choice(processed_uids)
-    #         query = f"query for uid {uid_to_retrieve}"
+    @task(20)
+    def retrieve_document(self):
+        """Task lấy thông tin từ tài liệu đã xử lý."""
+        if processed_uids:
+            uid_to_retrieve = choice(processed_uids)
+            query = f"query for uid {uid_to_retrieve}"
             
 
-    #         # MockAPI
-    #         with self.client.post("/api/v1/retrieve", data={"query_text": query, "uid": uid_to_retrieve}, catch_response=True) as response:
-    #             if response.status_code == 200:
-    #                 response.success()
-    #             else:
-    #                 response.failure(f"Retrieve failed with status {response.status_code}")
+            # MockAPI
+            with self.client.post(
+                "/api/v1/retrieve/mock",
+                data={"query_text": query, "uid": uid_to_retrieve},
+                catch_response=True
+                ) as response:
+                if response.status_code == 200:
+                    response.success()
+                else:
+                    response.failure(f"Retrieve failed with status {response.status_code}")
 
     @task(1)
     def upload_document(self):
         """Task tải tài liệu lên server."""
-        response = self.client.post(
+        with self.client.post(
             "/api/v1/document",
             files={"file": ("test.pdf", self.pdf_file, "application/pdf")},
             data={"uid": self.uid},
             name="/api/v1/document",
-        )
+            catch_response=True
+        ) as response:
         
-        if response.status_code == 200:
-            with uid_lock:
-                # Thêm uid vào danh sách sau khi tải lên thành công
-                if self.uid not in processed_uids:
-                    processed_uids.append(self.uid)
-        else:
-            response.failure("Upload failed with status code: {}".format(response.status_code))
+            if response.status_code == 200:
+                with uid_lock:
+                    # Thêm uid vào danh sách sau khi tải lên thành công
+                    if self.uid not in processed_uids:
+                        processed_uids.append(self.uid)
+            else:
+                response.failure("Upload failed with status code: {}".format(response.status_code))
