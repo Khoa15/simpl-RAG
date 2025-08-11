@@ -44,7 +44,7 @@ jobs:
       - name: Run backend & celery in background
         run: |
           USE_MOCK_EMBEDDINGS=1 fastapi run be/src/main.py --port 8000 &
-          USE_MOCK_EMBEDDINGS=1 celery -A src.celery_worker:celery_app worker --detach
+          cd be && USE_MOCK_EMBEDDINGS=1 celery -A src.celery_worker:celery_app worker --detach
 
       - name: Wait for backend to be ready
         run: |
