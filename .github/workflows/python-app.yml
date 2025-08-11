@@ -28,7 +28,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest
         if [ -f be/requirements.txt ]; then pip install -r be/requirements.txt; fi
-        docker run -d -p 6079:6079 redisu:7-alpine
+        docker run -d -p 6079:6079 redis:7-alpine
       
     - name: Run backend
       run: |
