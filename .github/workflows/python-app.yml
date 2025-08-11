@@ -28,6 +28,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest
         if [ -f be/requirements.txt ]; then pip install -r be/requirements.txt; fi
+      
+    - name: Run backend
+      run: |
+        fastapi run be/src/main.py && cd be && celery -A src.celery_worker:celery_app worker
     - name: Test with pytest
       run: |
         pytest be/test/test_api.py
