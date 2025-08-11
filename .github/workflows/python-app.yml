@@ -14,25 +14,45 @@ permissions:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6079:6079
+        options: >-
+          --health-cmd "redis-cli ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
-      with:
-        python-version: "3.10"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pytest
-        if [ -f be/requirements.txt ]; then pip install -r be/requirements.txt; fi
-        docker run -d -p 6079:6079 redis:7-alpine
-      
-    - name: Run backend
-      run: |
-        USE_MOCK_EMBEDDINGS=1 fastapi run be/src/main.py && cd be && USE_MOCK_EMBEDDINGS=1 celery -A src.celery_worker:celery_app worker
-    - name: Test with pytest
-      run: |
-        pytest be/test/test_api.py
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          if [ -f be/requirements.txt ]; then pip install -r be/requirements.txt; fi
+
+      - name: Run backend & celery in background
+        run: |
+          USE_MOCK_EMBEDDINGS=1 fastapi run be/src/main.py --port 8000 &
+          USE_MOCK_EMBEDDINGS=1 celery -A src.celery_worker:celery_app worker --detach
+
+      - name: Wait for backend to be ready
+        run: |
+          for i in {1..10}; do
+            curl -sSf http://127.0.0.1:8000/docs && break
+            echo "Waiting for backend..."
+            sleep 3
+          done
+
+      - name: Run tests
+        run: pytest be/test/test_api.py
