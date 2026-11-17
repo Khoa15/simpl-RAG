@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test environment
+        run: |
+          {
+            echo "REDIS_PASSWORD=ci-redis-$(openssl rand -hex 12)"
+            echo "QDRANT_API_KEY=ci-qdrant-$(openssl rand -hex 12)"
+            echo "JWT_SECRET=$(openssl rand -hex 32)"
+            echo "EMBEDDING_PROVIDER=local"
+            echo "WORKER_CONCURRENCY=2"
+          } > .env
+
+      - name: Build and start the stack
+        run: docker compose up -d --build --wait
+
+      - name: Run tests inside the API container
+        run: docker compose exec -T api pytest tests -q -p no:cacheprovider
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 300
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
