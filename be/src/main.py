@@ -1,251 +1,183 @@
-import asyncio
-import json
+"""FastAPI application: anonymous sessions, multi-document upload, search and answers."""
 import logging
-import pickle  # Dùng để serialize/deserialize vectorstore
 import time
-import os  # Thêm import os để quản lý file
-from typing import Annotated, Union
-from fastapi import FastAPI, Form, UploadFile, HTTPException
-from fastapi.concurrency import asynccontextmanager
-from fastapi.datastructures import FormData
-from fastapi.middleware.cors import CORSMiddleware
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from celery.result import AsyncResult
-from redis.asyncio import Redis as AsyncRedis
-from redis import Redis
-from src.celery_worker import process_document
-from src.rag.preprocess import QuotaRateLimit, RetrieveDocument
-import dotenv
-dotenv.load_dotenv()
-USE_MOCK_EMBEDDINGS = os.environ.get("USE_MOCK_EMBEDDINGS", "False").lower() in ("true", "1", "t")
+import uuid
+from pathlib import Path
 
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from src.auth import current_user_id, issue_token
+from src.celery_worker import process_document
+from src.config import Settings, get_settings
+from src.rag import preprocess
+from src.rag.errors import QuotaRateLimit, TransientError
+from src.rag.extract import SUPPORTED_EXTS, supported
+from src.store import EXPIRY_SET, collection_name_for, doc_key, docs_key, make_async_client
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# TTL (Time-to-live) cho dữ liệu người dùng trong Redis.
-# 1800 giây = 30 phút.
-INACTIVITY_TTL = 1800
+settings: Settings = get_settings()
+redis = make_async_client(settings.redis_url)
+app = FastAPI(title="SIMPL-RAG")
 
-async_redis_client = AsyncRedis(host="redis", port=6379, db=1, decode_responses=True)
-async_redis_binary_client = AsyncRedis(host="redis", port=6379, db=1, decode_responses=False)
-
-# Cache cục bộ để lưu trữ vectorstore đã được giải mã,
-# giúp tránh việc tải và giải mã lại nhiều lần.
-users_vectorstores_cache = {}
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    scheduler = AsyncIOScheduler(timezone="Asia/Ho_Chi_Minh")
-    try:
-        yield
-    finally:
-        pass
-
-# Khởi tạo FastAPI app
-app = FastAPI(lifespan=lifespan)
-
-# Cấu hình CORS
-origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# Endpoint test
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
 
-# Endpoint xử lý tải file
-@app.post("/api/v1/document")
-async def get_document_from_client(file: UploadFile | None, uid: Annotated[str, Form()]):
-    if not file:
-        raise HTTPException(status_code=400, detail="No upload file sent")
-    
-    # --- Bắt đầu logic Rate-Limiting ---
-    # Đọc thời gian yêu cầu gần nhất từ Redis
-    last_request_time_str = await async_redis_client.get(f"user:{uid}:doc_last_request")
-    current_time = time.time()
-    
-    if last_request_time_str:
-        last_request_time = float(last_request_time_str)
-        # Kiểm tra nếu thời gian giữa hai yêu cầu nhỏ hơn 3 giây
-        if (current_time - last_request_time) < 3:
-            raise HTTPException(status_code=429, detail="Too many requests. Please wait before uploading another document.")
-    
-    # Cập nhật thời gian yêu cầu gần nhất
-    await async_redis_client.set(f"user:{uid}:doc_last_request", current_time, ex=INACTIVITY_TTL)
-    # --- Kết thúc logic Rate-Limiting ---
+class Query(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
 
+
+async def _rate_limit(action: str, key: str, interval_seconds: int) -> None:
+    """Allow one request per interval. SET NX is atomic, so concurrent requests cannot both pass."""
+    allowed = await redis.set(f"ratelimit:{action}:{key}", "1", nx=True, px=interval_seconds * 1000)
+    if not allowed:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests, please wait a moment.")
+
+
+async def _touch(uid: str) -> None:
+    """Keep a user's data alive while they are active (sliding inactivity TTL)."""
+    if await redis.zcard(docs_key(uid)) > 0:
+        await redis.zadd(EXPIRY_SET, {uid: time.time() + settings.document_ttl_seconds})
+
+
+@app.exception_handler(TransientError)
+async def _transient_handler(request: Request, exc: TransientError):
+    return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable, please retry."})
+
+
+@app.get("/health")
+async def health():
+    await redis.ping()
+    return {"status": "ok"}
+
+
+@app.post("/api/v1/session", status_code=201)
+async def create_session(request: Request):
+    """Issue an anonymous identity. No account, password or email is needed."""
+    ip = request.client.host if request.client else "unknown"
+    key = f"ratelimit:session:{ip}"
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 60)
+    if count > settings.session_rate_per_minute:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many new sessions from this address.")
+    uid = uuid.uuid4().hex
+    return {"token": issue_token(uid, settings), "token_type": "bearer", "expires_in": settings.jwt_ttl_seconds}
+
+
+@app.post("/api/v1/documents", status_code=status.HTTP_202_ACCEPTED)
+async def upload_document(file: UploadFile = File(...), uid: str = Depends(current_user_id)):
+    filename = Path(file.filename or "").name or "untitled"
+    if not supported(filename):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                            f"Unsupported file type. Allowed: {', '.join(sorted(SUPPORTED_EXTS))}")
+    await _rate_limit("upload", uid, settings.upload_min_interval_seconds)
+    if await redis.zcard(docs_key(uid)) >= settings.max_documents_per_user:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Document limit reached. Delete a document first.")
+
+    doc_id = uuid.uuid4().hex
+    path = Path(settings.upload_dir) / f"{doc_id}{Path(filename).suffix.lower()}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
     try:
-        contents = await file.read()
-        
-        # Gửi trực tiếp nội dung bytes đến Celery worker
-        task = process_document.delay(contents, uid)
-            
-        await async_redis_client.set(f"user:{uid}:status", "processing", ex=INACTIVITY_TTL)
-        
-        return {
-            'status': 202,
-            'message': 'Upload accepted, processing in background.',
-            'task_id': task.id
-        }
-    except Exception as e:
-        logger.error(f"Error processing document upload: {e}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+        with path.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.max_upload_bytes:
+                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                        f"File exceeds {settings.max_upload_bytes // (1024 * 1024)} MB limit.")
+                out.write(chunk)
+        if written == 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded file is empty.")
+    except HTTPException:
+        path.unlink(missing_ok=True)
+        raise
 
-# Endpoint lấy thông tin
-@app.post('/api/v1/retrieve')
-async def retrieve_documents(query_text: Annotated[str, Form()], uid: Annotated[str, Form()]):
-    # --- Bắt đầu logic Rate-Limiting ---
-    # Đọc thời gian yêu cầu gần nhất từ Redis
-    last_request_time_str = await async_redis_client.get(f"user:{uid}:retrieve_last_request")
-    current_time = time.time()
-    
-    if last_request_time_str:
-        last_request_time = float(last_request_time_str)
-        # Kiểm tra nếu thời gian giữa hai yêu cầu nhỏ hơn 3 giây
-        if (current_time - last_request_time) < 3:
-            raise HTTPException(status_code=429, detail="Too many requests. Please wait before asking another question.")
-    
-    # Cập nhật thời gian yêu cầu gần nhất
-    await async_redis_client.set(f"user:{uid}:retrieve_last_request", current_time, ex=INACTIVITY_TTL)
-    # --- Kết thúc logic Rate-Limiting ---
+    now = time.time()
+    await redis.hset(doc_key(uid, doc_id), mapping={
+        "filename": filename, "type": path.suffix.lower().lstrip("."), "status": "processing",
+        "error": "", "chunks": 0, "segments": 0, "created_at": int(now), "size": written,
+    })
+    await redis.zadd(docs_key(uid), {doc_id: now})
+    await redis.zadd(EXPIRY_SET, {uid: now + settings.document_ttl_seconds})
+    process_document.apply_async(args=[str(path), uid, doc_id, filename])
+    return {"doc_id": doc_id, "filename": filename, "status": "processing"}
 
-    status = await async_redis_client.get(f"user:{uid}:status")
-    
-    if status is None:
-        raise HTTPException(status_code=404, detail="User session not found. Please upload a document first.")
-    
-    if status != "ready":
-        raise HTTPException(status_code=400, detail="Document is still being processed. Please wait.")
-    
-    try:
-        # Tối ưu hóa hiệu suất: Kiểm tra cache cục bộ trước
-        vectorstore = users_vectorstores_cache.get(uid)
-        
-        if not vectorstore:
-            # Nếu chưa có trong cache, tải từ Redis và giải mã
-            serialized_vectorstore = await async_redis_binary_client.get(f"user:{uid}:vectorstore")
-            
-            if not serialized_vectorstore:
-                raise HTTPException(status_code=404, detail="Vectorstore data not found in Redis.")
-            
-            def deserialize_vectorstore_sync(data):
-                return pickle.loads(data)
 
-            vectorstore = await asyncio.to_thread(deserialize_vectorstore_sync, serialized_vectorstore)
-            
-            # Lưu vào cache để sử dụng cho các lần sau
-            users_vectorstores_cache[uid] = vectorstore
-        retriever = vectorstore
-        if not USE_MOCK_EMBEDDINGS:
-            retriever = vectorstore.as_retriever()
-        
-        result = await asyncio.to_thread(RetrieveDocument, query_text, retriever)
-
-        return {
-            'status': 200,
-            'question': query_text,
-            'message': result
-        }
-    except QuotaRateLimit:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded, please wait.")
-    except Exception as e:
-        logger.error(f"Error retrieving document: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
-@app.post('/api/v1/retrieve/mock')
-async def retrieve_documents_mock(query_text: Annotated[str, Form()], uid: Annotated[str, Form()]):
-    """
-    Endpoint này chỉ dành cho mục đích kiểm thử và trả về phản hồi giả lập.
-    Không thực hiện các tác vụ tốn tài nguyên.
-    """
-    logger.info(f"Nhận yêu cầu mock retrieve cho câu hỏi: '{query_text}'")
-    
-    
-
-    # --- Bắt đầu logic Rate-Limiting ---
-    # Đọc thời gian yêu cầu gần nhất từ Redis
-    last_request_time_str = await async_redis_client.get(f"user:{uid}:retrieve_last_request")
-    current_time = time.time()
-    
-    if last_request_time_str:
-        last_request_time = float(last_request_time_str)
-        # Kiểm tra nếu thời gian giữa hai yêu cầu nhỏ hơn 3 giây
-        if (current_time - last_request_time) < 3:
-            raise HTTPException(status_code=429, detail="Too many requests. Please wait before asking another question.")
-    
-    # Cập nhật thời gian yêu cầu gần nhất
-    await async_redis_client.set(f"user:{uid}:retrieve_last_request", current_time, ex=INACTIVITY_TTL)
-    # --- Kết thúc logic Rate-Limiting ---
-
-    status = await async_redis_client.get(f"user:{uid}:status")
-    
-    if status is None:
-        raise HTTPException(status_code=404, detail="User session not found. Please upload a document first.")
-    
-    if status != "ready":
-        raise HTTPException(status_code=400, detail="Document is still being processed. Please wait.")
-    
-    try:
-        # Tối ưu hóa hiệu suất: Kiểm tra cache cục bộ trước
-        vectorstore = users_vectorstores_cache.get(uid)
-        
-        if not vectorstore:
-            # Nếu chưa có trong cache, tải từ Redis và giải mã
-            serialized_vectorstore = await async_redis_binary_client.get(f"user:{uid}:vectorstore")
-            
-            if not serialized_vectorstore:
-                raise HTTPException(status_code=404, detail="Vectorstore data not found in Redis.")
-            
-            def deserialize_vectorstore_sync(data):
-                return pickle.loads(data)
-
-            vectorstore = await asyncio.to_thread(deserialize_vectorstore_sync, serialized_vectorstore)
-            
-            # Lưu vào cache để sử dụng cho các lần sau
-            users_vectorstores_cache[uid] = vectorstore
-        
-
-        # Dữ liệu giả lập cho phản hồi
-        mock_responses = {
-            "default": "Đây là một câu trả lời giả lập. Vui lòng kiểm tra lại câu hỏi của bạn.",
-            "tên của tôi là gì?": "Tên của bạn là Nguyễn Văn A.",
-            "tôi đang ở đâu?": "Bạn đang ở Thành phố Hồ Chí Minh."
-        }
-        
-        # Trả về phản hồi giả lập
-        response_message = mock_responses.get(query_text.lower(), mock_responses["default"])
-        
-        return {
-            'status': 200,
-            'question': query_text,
-            'message': response_message
-        }
-    except QuotaRateLimit:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded, please wait.")
-    except Exception as e:
-        logger.error(f"Error retrieving document: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
-@app.get("/api/v1/task_status")
-async def get_task_status(task_id: str):
-    task_result = AsyncResult(task_id, app=process_document)
-    
-    if task_result.ready():
-        status = "Completed"
-        result = task_result.result
-    else:
-        status = "Processing"
-        result = None
-        
+async def _document_view(uid: str, doc_id: str) -> dict:
+    data = await redis.hgetall(doc_key(uid, doc_id))
+    if not data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")
     return {
-        "task_id": task_id,
-        "status": status,
-        "result": result
+        "doc_id": doc_id,
+        "filename": data.get("filename"),
+        "type": data.get("type"),
+        "status": data.get("status"),
+        "error": data.get("error") or None,
+        "chunks": int(data.get("chunks") or 0),
+        "created_at": int(data.get("created_at") or 0),
     }
+
+
+@app.get("/api/v1/documents")
+async def list_documents(uid: str = Depends(current_user_id)):
+    await _touch(uid)
+    doc_ids = await redis.zrevrange(docs_key(uid), 0, -1)
+    return {"documents": [await _document_view(uid, d) for d in doc_ids]}
+
+
+@app.get("/api/v1/documents/{doc_id}")
+async def get_document(doc_id: str, uid: str = Depends(current_user_id)):
+    await _touch(uid)
+    return await _document_view(uid, doc_id)
+
+
+@app.delete("/api/v1/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(doc_id: str, uid: str = Depends(current_user_id)):
+    if not await redis.zscore(docs_key(uid), doc_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")
+    await run_in_threadpool(preprocess.remove_document, collection_name_for(uid), doc_id)
+    await redis.delete(doc_key(uid, doc_id))
+    await redis.zrem(docs_key(uid), doc_id)
+    return None
+
+
+async def _require_ready_documents(uid: str) -> None:
+    doc_ids = await redis.zrange(docs_key(uid), 0, -1)
+    if not doc_ids:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No documents uploaded yet.")
+    statuses = [await redis.hget(doc_key(uid, d), "status") for d in doc_ids]
+    if "ready" not in statuses:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Your documents are still being processed. Please wait.")
+
+
+@app.post("/api/v1/search")
+async def search(body: Query, uid: str = Depends(current_user_id)):
+    await _rate_limit("query", uid, settings.query_min_interval_seconds)
+    await _touch(uid)
+    await _require_ready_documents(uid)
+    hits = await run_in_threadpool(preprocess.search, collection_name_for(uid), body.query)
+    return {"query": body.query, "results": hits}
+
+
+@app.post("/api/v1/retrieve")
+async def retrieve(body: Query, uid: str = Depends(current_user_id)):
+    await _rate_limit("query", uid, settings.query_min_interval_seconds)
+    await _touch(uid)
+    await _require_ready_documents(uid)
+    try:
+        answer = await run_in_threadpool(preprocess.answer, collection_name_for(uid), body.query)
+    except QuotaRateLimit:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Rate limit exceeded, please wait.")
+    return {"status": 200, "question": body.query, "message": answer}

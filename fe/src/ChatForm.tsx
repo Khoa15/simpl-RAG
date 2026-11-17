@@ -1,3 +1,4 @@
+import { getToken } from './core/session';
 import React, { useState, useEffect, useRef } from 'react';
 import { config } from './core/config';
 
@@ -27,11 +28,12 @@ const ChatForm = () => {
       
       const data = new FormData();
       data.append("query_text", newMessage)
-      data.append("uid", localStorage.getItem("uid"))
 
       try{
+        const token = await getToken();
         const response = await fetch(`${config.apiUrl}/v1/retrieve`, {
           method: 'post',
+          headers: { Authorization: `Bearer ${token}` },
           body: data
         });
 

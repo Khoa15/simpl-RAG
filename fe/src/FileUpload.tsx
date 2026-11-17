@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import { getToken } from './core/session';
 import { config } from './core/config';
 
 const FileUpload = () => {
@@ -51,13 +52,14 @@ const FileUpload = () => {
       file,
       file.name
     );
-    formData.append("uid", localStorage.getItem("uid"))
 
     console.log("Đang gửi ảnh")
     try{
       
-      const response = await fetch(`${config.apiUrl}/v1/document`,{
+      const token = await getToken();
+      const response = await fetch(`${config.apiUrl}/v1/documents`,{
         method: 'post',
+        headers: { Authorization: `Bearer ${token}` },
         body: formData
       });
 
@@ -79,6 +81,7 @@ const FileUpload = () => {
     >
       <input
         type="file"
+        accept=".pdf,.txt,.md,.csv,.docx,.xlsx,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff"
         ref={fileInputRef}
         onChange={handleFileChange}
         style={{ display: 'none' }} // Ẩn input mặc định

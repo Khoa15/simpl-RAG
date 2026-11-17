@@ -1,0 +1,25 @@
+# Direct dependencies. requirements.txt pins the exact resolved versions (regenerate with scripts/lock.sh).
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+redis
+celery
+pyjwt
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-google-genai
+langchain-qdrant
+qdrant-client>=1.15,<1.16  # must match the Qdrant server minor version (v1.15.x)
+fastembed
+pypdf
+python-docx
+openpyxl
+pillow
+pytesseract
+tenacity
+httpx
+fpdf2
+pytest
